@@ -30,7 +30,6 @@ def get_json(url):
 
 
 def parse_date(value):
-    """Use UTC. Do not shift dates to Kolkata for month filtering."""
     text = str(value).replace("Z", "+00:00")
     dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
@@ -91,10 +90,6 @@ def order_quantity(order):
 
 
 def order_unit_amount(order):
-    """
-    Find the per-order money value.
-    Priority: explicit unit price fields, then amount/total fields.
-    """
     for key in ["unit_price", "price", "unit_amount", "rate"]:
         if key in order and order[key] is not None:
             return float(order[key])
@@ -111,10 +106,9 @@ def usd_amount(order, rates):
     if currency not in rates:
         raise ValueError(f"Missing USD conversion rate for {currency}")
 
-    qty = order_quantity(order)
-    unit_amount = order_unit_amount(order)
-
-    return float(unit_amount) * qty * float(rates[currency])
+    # amount is already qty * unit_price, so use amount directly.
+    amount = float(order.get("amount", 0) or 0)
+    return amount * float(rates[currency])
 
 
 def contains_phrase(text, phrases):
@@ -198,7 +192,7 @@ def apply_filters(orders, filters, allowed_statuses=None):
     if month or year:
         filtered = []
         for order in result:
-            created = order.get("created_at") or order.get("date") or order.get("timestamp")
+            created = order.get("created_at")
             if not created:
                 continue
 
@@ -228,8 +222,9 @@ def product_revenue(orders, rates):
 
     for order in orders:
         name = str(order.get("product", "Unknown")).strip()
+        amount = usd_amount(order, rates)
 
-        revenue[name] = revenue.get(name, 0.0) + usd_amount(order, rates)
+        revenue[name] = revenue.get(name, 0.0) + amount
         units[name] = units.get(name, 0) + order_quantity(order)
 
     return revenue, units
@@ -268,7 +263,6 @@ def answer_question(question):
     )
     asks_total = contains_phrase(q, ["total", "sum", "overall", "altogether"])
 
-    # Customers: distinct customer count.
     if asks_customer:
         customer_orders = apply_filters(orders, filters)
         customers = {
@@ -278,7 +272,6 @@ def answer_question(question):
         }
         return len(customers)
 
-    # Refunds.
     if asks_refund:
         refund_orders = apply_filters(
             orders, filters, allowed_statuses={"refunded"}
@@ -297,18 +290,11 @@ def answer_question(question):
         total = sum(usd_amount(o, rates) for o in refund_orders)
         return round(total, 2)
 
-    # Product questions.
     if asks_product:
-        # Try paid orders first.
+        # Revenue includes paid and refunded orders; excludes void orders.
         product_orders = apply_filters(
-            orders, filters, allowed_statuses={"paid"}
+            orders, filters, allowed_statuses={"paid", "refunded"}
         )
-
-        # Fallback: if no paid orders, use every non-void order.
-        if not product_orders:
-            product_orders = apply_filters(
-                orders, filters, allowed_statuses={"paid", "refunded"}
-            )
 
         if not product_orders:
             return 0.0
@@ -319,11 +305,9 @@ def answer_question(question):
 
         if asks_top:
             if asks_units:
-                name = max(units_by_product, key=units_by_product.get)
-                return name
+                return max(units_by_product, key=units_by_product.get)
 
-            name = max(revenue_by_product, key=revenue_by_product.get)
-            return name
+            return max(revenue_by_product, key=revenue_by_product.get)
 
         if filters["product"]:
             if asks_units:
@@ -331,13 +315,11 @@ def answer_question(question):
 
             return round(revenue_by_product.get(filters["product"], 0.0), 2)
 
-        # If somehow no top/product specified, return highest-revenue product.
         return max(revenue_by_product, key=revenue_by_product.get)
 
-    # Average order value.
     if asks_average:
         average_orders = apply_filters(
-            orders, filters, allowed_statuses={"paid"}
+            orders, filters, allowed_statuses={"paid", "refunded"}
         )
 
         if not average_orders:
@@ -346,16 +328,14 @@ def answer_question(question):
         avg = sum(usd_amount(o, rates) for o in average_orders) / len(average_orders)
         return round(avg, 2)
 
-    # Revenue.
     if asks_revenue:
         revenue_orders = apply_filters(
-            orders, filters, allowed_statuses={"paid"}
+            orders, filters, allowed_statuses={"paid", "refunded"}
         )
 
         total = sum(usd_amount(o, rates) for o in revenue_orders)
         return round(total, 2)
 
-    # Order count.
     if asks_count or contains_phrase(q, ["orders", "order count"]):
         count_orders = apply_filters(orders, filters)
         return len(count_orders)
@@ -389,7 +369,6 @@ def answer(request: QuestionRequest):
 @app.get("/debug")
 def debug():
     orders, rates = load_data()
-
     sample = orders[:5]
 
     return {
@@ -404,19 +383,35 @@ def debug():
 def debug_product_revenue(month: int = None, year: int = None):
     orders, rates = load_data()
 
-    filters = {"region": None, "month": month, "year": year, "status": None, "product": None}
+    filters = {
+        "region": None,
+        "month": month,
+        "year": year,
+        "status": None,
+        "product": None,
+    }
 
-    paid_orders = apply_filters(orders, filters, allowed_statuses={"paid"})
-    revenue, units = product_revenue(paid_orders, rates)
+    paid_only = apply_filters(
+        orders, filters, allowed_statuses={"paid"}
+    )
+    non_void = apply_filters(
+        orders, filters, allowed_statuses={"paid", "refunded"}
+    )
+
+    paid_revenue, paid_units = product_revenue(paid_only, rates)
+    non_void_revenue, non_void_units = product_revenue(non_void, rates)
 
     return {
         "month": month,
         "year": year,
-        "paid_orders": len(paid_orders),
-        "revenue_by_product": revenue,
-        "units_by_product": units,
-        "top_by_revenue": max(revenue, key=revenue.get) if revenue else None,
-        "top_by_units": max(units, key=units.get) if units else None,
+        "paid_orders": len(paid_only),
+        "non_void_orders": len(non_void),
+        "paid_only_top": max(paid_revenue, key=paid_revenue.get) if paid_revenue else None,
+        "non_void_top": max(non_void_revenue, key=non_void_revenue.get) if non_void_revenue else None,
+        "paid_only_revenue": paid_revenue,
+        "non_void_revenue": non_void_revenue,
+        "paid_only_units": paid_units,
+        "non_void_units": non_void_units,
     }
 
 
