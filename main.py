@@ -1,9 +1,9 @@
-
 import json
 import os
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from functools import lru_cache
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -31,37 +31,52 @@ def get_json(url):
 
 def parse_date(value):
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=KOLKATA)
+
     return dt.astimezone(KOLKATA)
 
 
+@lru_cache(maxsize=1)
 def load_data():
     if not API_URL:
-        raise RuntimeError("LEDGER_API_URL environment variable is missing")
+        raise RuntimeError(
+            "LEDGER_API_URL environment variable is missing"
+        )
 
-    # Discover the API's documented-by-response links.
+    # Discover API links.
     root = get_json(API_URL)
     links = root.get("links", {})
 
     if not links.get("export") or not links.get("rates"):
-        raise RuntimeError("API root did not provide export and rates links")
+        raise RuntimeError(
+            "API root did not provide export and rates links"
+        )
 
-    # Load the current order export.
+    # Download the order export.
     response = requests.get(links["export"], timeout=TIMEOUT)
     response.raise_for_status()
 
+    # Keep the latest version of each order.
     latest = {}
+
     for line in response.text.splitlines():
         if not line.strip():
             continue
+
         order = json.loads(line)
         order_id = order["id"]
         old = latest.get(order_id)
 
-        if old is None or parse_date(order["updated_at"]) > parse_date(old["updated_at"]):
+        if (
+            old is None
+            or parse_date(order["updated_at"])
+            > parse_date(old["updated_at"])
+        ):
             latest[order_id] = order
 
+    # Load currency conversion rates.
     rates_data = get_json(links["rates"])
     rates = rates_data["usd_per_unit"]
 
@@ -70,8 +85,10 @@ def load_data():
 
 def usd_amount(order, rates):
     currency = order["currency"]
+
     if currency not in rates:
         raise ValueError(f"Unknown currency: {currency}")
+
     return float(order["amount"]) * float(rates[currency])
 
 
@@ -79,14 +96,24 @@ def answer_question(question):
     orders, rates = load_data()
     q = question.lower()
 
-    # Region and date filters.
+    # Region filter.
     regions = ["north", "south", "east", "west"]
-    region = next((r for r in regions if re.search(rf"\b{r}\b", q)), None)
 
-    month = next(
-        (num for name, num in MONTHS.items() if re.search(rf"\b{name}\b", q)),
+    region = next(
+        (r for r in regions if re.search(rf"\b{r}\b", q)),
         None,
     )
+
+    # Month and year filters.
+    month = next(
+        (
+            num
+            for name, num in MONTHS.items()
+            if re.search(rf"\b{name}\b", q)
+        ),
+        None,
+    )
+
     year_match = re.search(r"\b20\d{2}\b", q)
     year = int(year_match.group()) if year_match else None
 
@@ -94,29 +121,79 @@ def answer_question(question):
 
     if region:
         filtered = [
-            o for o in filtered
-            if str(o.get("region", "")).lower() == region
+            order for order in filtered
+            if str(order.get("region", "")).lower() == region
         ]
 
     if month or year:
         filtered = [
-            o for o in filtered
+            order for order in filtered
             if (
-                (not month or parse_date(o["created_at"]).month == month)
-                and (not year or parse_date(o["created_at"]).year == year)
+                (not month or parse_date(
+                    order["created_at"]
+                ).month == month)
+                and
+                (not year or parse_date(
+                    order["created_at"]
+                ).year == year)
             )
         ]
 
-    statuses = [str(o.get("status", "")).lower() for o in filtered]
-    paid = [o for o in filtered if str(o.get("status", "")).lower() == "paid"]
-    refunded = [
-        o for o in filtered
-        if str(o.get("status", "")).lower() == "refunded"
+    # Status filters.
+    paid = [
+        order for order in filtered
+        if str(order.get("status", "")).lower() == "paid"
     ]
 
-    # Refunds.
-    if any(w in q for w in ["refund", "refunded", "refunded amount"]):
-        total = sum(usd_amount(o, rates) for o in refunded)
+    refunded = [
+        order for order in filtered
+        if str(order.get("status", "")).lower() == "refunded"
+    ]
+
+    # Average order value MUST come before order-count logic.
+    average_question = any(
+        phrase in q
+        for phrase in [
+            "average",
+            "avg",
+            "mean",
+            "per order",
+            "worth",
+        ]
+    )
+
+    if average_question:
+        if "refund" in q:
+            average_orders = refunded
+        else:
+            # Average paid order value.
+            average_orders = paid
+
+        if not average_orders:
+            return "No matching orders were found."
+
+        total = sum(
+            usd_amount(order, rates)
+            for order in average_orders
+        )
+
+        average = total / len(average_orders)
+
+        return (
+            f"The average order value is "
+            f"${average:,.2f} USD."
+        )
+
+    # Refund questions.
+    if any(
+        word in q
+        for word in ["refund", "refunded"]
+    ):
+        total = sum(
+            usd_amount(order, rates)
+            for order in refunded
+        )
+
         return (
             f"There are {len(refunded)} refunded orders. "
             f"Their total amount is ${total:,.2f} USD."
@@ -124,22 +201,52 @@ def answer_question(question):
 
     # Unique customers.
     if "customer" in q or "customers" in q:
-        customers = {o.get("customer") for o in filtered if o.get("customer")}
+        customers = {
+            order.get("customer")
+            for order in filtered
+            if order.get("customer")
+        }
+
         return f"There are {len(customers)} unique customers."
 
     # Product revenue and top product.
-    if any(w in q for w in ["product", "products", "best-selling", "best selling"]):
+    if any(
+        word in q
+        for word in [
+            "product",
+            "products",
+            "best-selling",
+            "best selling",
+        ]
+    ):
         totals = {}
+
         for order in paid:
             name = order["product"]
-            totals[name] = totals.get(name, 0.0) + usd_amount(order, rates)
+            totals[name] = (
+                totals.get(name, 0.0)
+                + usd_amount(order, rates)
+            )
 
         if not totals:
             return "No matching paid orders were found."
 
-        if any(w in q for w in ["most", "highest", "top", "best", "which product"]):
+        if any(
+            word in q
+            for word in [
+                "most",
+                "highest",
+                "top",
+                "best",
+                "which product",
+            ]
+        ):
             name = max(totals, key=totals.get)
-            return f"{name} has the highest revenue at ${totals[name]:,.2f} USD."
+
+            return (
+                f"{name} has the highest revenue at "
+                f"${totals[name]:,.2f} USD."
+            )
 
         return "Product revenue (USD): " + "; ".join(
             f"{name}: ${amount:,.2f}"
@@ -147,17 +254,40 @@ def answer_question(question):
         )
 
     # Revenue includes paid orders only.
-    if any(w in q for w in ["revenue", "sales", "earned", "income", "turnover"]):
-        total = sum(usd_amount(o, rates) for o in paid)
+    if any(
+        word in q
+        for word in [
+            "revenue",
+            "sales",
+            "earned",
+            "income",
+            "turnover",
+        ]
+    ):
+        total = sum(
+            usd_amount(order, rates)
+            for order in paid
+        )
+
         return f"Total revenue is ${total:,.2f} USD."
 
     # Order counts.
-    if any(w in q for w in ["count", "number of", "how many", "orders", "order count"]):
+    if any(
+        word in q
+        for word in [
+            "count",
+            "number of",
+            "how many",
+            "orders",
+            "order count",
+        ]
+    ):
         return f"There are {len(filtered)} matching orders."
 
     return (
-        "Please ask about revenue, refunds, products, customers, "
-        "or order counts. You can include a region, month, or year."
+        "Please ask about revenue, refunds, average order value, "
+        "products, customers, or order counts. "
+        "You can include a region, month, or year."
     )
 
 
@@ -180,4 +310,9 @@ def answer(request: QuestionRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
