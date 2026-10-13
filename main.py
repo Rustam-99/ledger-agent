@@ -150,6 +150,7 @@ def answer_question(question):
         if str(order.get("status", "")).lower() == "refunded"
     ]
 
+
     # Average order value MUST come before order-count logic.
     average_question = any(
         phrase in q
@@ -179,10 +180,19 @@ def answer_question(question):
 
         average = total / len(average_orders)
 
+        # Temporary debugging line
+        print(
+            "Average check:",
+            len(average_orders),
+            total,
+            average,
+        )
+
         return (
             f"The average order value is "
             f"${average:,.2f} USD."
         )
+
 
     # Refund questions.
     if any(
