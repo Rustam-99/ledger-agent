@@ -287,6 +287,7 @@ def answer_question(question):
         for word in [
             "revenue",
             "sales",
+            "earn",
             "earned",
             "income",
             "turnover",
