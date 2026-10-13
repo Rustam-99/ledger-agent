@@ -194,11 +194,22 @@ def answer_question(question):
         )
 
 
+    
     # Refund questions.
-    if any(
-        word in q
-        for word in ["refund", "refunded"]
-    ):
+    if any(word in q for word in ["refund", "refunded"]):
+        # If the question asks for a count, return the count.
+        if any(
+            phrase in q
+            for phrase in [
+                "count",
+                "how many",
+                "number of",
+                "orders",
+            ]
+        ):
+            return f"There are {len(refunded)} refunded orders."
+
+        # Otherwise, return the refunded amount.
         total = sum(
             usd_amount(order, rates)
             for order in refunded
@@ -209,7 +220,6 @@ def answer_question(question):
             f"Their total amount is ${total:,.2f} USD."
         )
 
-    # Unique customers.
  
     # Unique customers, optionally filtered by product and paid status.
     if "customer" in q or "customers" in q:
