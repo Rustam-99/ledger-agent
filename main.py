@@ -200,14 +200,42 @@ def answer_question(question):
         )
 
     # Unique customers.
+ 
+    # Unique customers, optionally filtered by product and paid status.
     if "customer" in q or "customers" in q:
+        customer_orders = filtered
+
+        # If the question asks for paid orders only, filter by paid status.
+        if "paid" in q:
+            customer_orders = paid
+
+        # Detect a product name mentioned in the question.
+        product_names = {
+            str(order.get("product", "")).strip()
+            for order in orders
+            if order.get("product")
+        }
+
+        mentioned_products = [
+            name for name in product_names
+            if name.lower() in q
+        ]
+
+        if mentioned_products:
+            customer_orders = [
+                order for order in customer_orders
+                if str(order.get("product", "")).strip()
+                in mentioned_products
+            ]
+
         customers = {
             order.get("customer")
-            for order in filtered
+            for order in customer_orders
             if order.get("customer")
         }
 
         return f"There are {len(customers)} unique customers."
+
 
     # Product revenue and top product.
     if any(
