@@ -281,6 +281,7 @@ def answer_question(question):
             for name, amount in sorted(totals.items())
         )
 
+
     # Revenue includes paid orders only.
     if any(
         word in q
@@ -289,8 +290,11 @@ def answer_question(question):
             "sales",
             "earn",
             "earned",
+            "earns",
+            "earning",
             "income",
             "turnover",
+            "how much did",
         ]
     ):
         total = sum(
