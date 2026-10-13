@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Acme Appliances Ledger Agent")
 
 API_URL = os.getenv("LEDGER_API_URL")
-TIMEOUT = 10
+TIMEOUT = 20
 KOLKATA = ZoneInfo("Asia/Kolkata")
 
 MONTHS = {
@@ -22,7 +22,6 @@ MONTHS = {
     "july": 7, "august": 8, "september": 9,
     "october": 10, "november": 11, "december": 12,
 }
-
 REGIONS = ["north", "south", "east", "west", "central"]
 STATUSES = ["paid", "refunded", "void"]
 
@@ -34,26 +33,20 @@ def get_json(url):
 
 
 def parse_date(value):
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=KOLKATA)
     return dt.astimezone(KOLKATA)
 
 
 def parse_export(text):
-    """Support newline-delimited JSON and a JSON array."""
+    """Read either JSON array or newline-delimited JSON."""
     text = text.strip()
     if not text:
         return []
-
     if text.startswith("["):
         return json.loads(text)
-
-    return [
-        json.loads(line)
-        for line in text.splitlines()
-        if line.strip()
-    ]
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 @lru_cache(maxsize=1)
@@ -63,7 +56,6 @@ def load_data():
 
     root = get_json(API_URL)
     links = root.get("links", {})
-
     export_url = links.get("export")
     rates_url = links.get("rates")
 
@@ -74,18 +66,21 @@ def load_data():
     response.raise_for_status()
     raw_orders = parse_export(response.text)
 
-    # Retain only the latest version of each order ID.
+    # Keep the most recently updated record for each order ID.
     latest = {}
     for order in raw_orders:
-        order_id = order["id"]
-        previous = latest.get(order_id)
+        order_id = order.get("id")
+        if order_id is None:
+            continue
 
-        if (
-            previous is None
-            or parse_date(order["updated_at"])
-            > parse_date(previous["updated_at"])
-        ):
+        previous = latest.get(order_id)
+        if previous is None:
             latest[order_id] = order
+        else:
+            if parse_date(order["updated_at"]) >= parse_date(
+                previous["updated_at"]
+            ):
+                latest[order_id] = order
 
     rates_data = get_json(rates_url)
     rates = rates_data["usd_per_unit"]
@@ -94,12 +89,10 @@ def load_data():
 
 
 def usd_amount(order, rates, field="amount"):
-    currency = str(order["currency"]).upper()
-
+    currency = str(order.get("currency", "")).upper()
     if currency not in rates:
         raise ValueError(f"Missing USD conversion rate for {currency}")
-
-    return float(order[field]) * float(rates[currency])
+    return float(order.get(field, 0)) * float(rates[currency])
 
 
 def contains_phrase(text, phrases):
@@ -110,48 +103,30 @@ def detect_filters(question, orders):
     q = question.lower()
 
     region = next(
-        (
-            r for r in REGIONS
-            if re.search(rf"\b{re.escape(r)}\b", q)
-        ),
-        None,
+        (r for r in REGIONS if re.search(rf"\b{r}\b", q)), None
     )
-
     month = next(
-        (
-            number for name, number in MONTHS.items()
-            if re.search(rf"\b{name}\b", q)
-        ),
-        None,
+        (n for name, n in MONTHS.items()
+         if re.search(rf"\b{name}\b", q)), None
     )
-
     year_match = re.search(r"\b20\d{2}\b", q)
     year = int(year_match.group()) if year_match else None
 
     status = next(
-        (
-            s for s in STATUSES
-            if re.search(rf"\b{s}\b", q)
-        ),
-        None,
+        (s for s in STATUSES if re.search(rf"\b{s}\b", q)), None
     )
 
-    # Find a product mentioned in the question using actual data values.
     products = sorted(
         {
             str(o.get("product", "")).strip()
-            for o in orders
-            if o.get("product")
+            for o in orders if o.get("product")
         },
         key=len,
         reverse=True,
     )
-
     product = next(
-        (
-            name for name in products
-            if re.search(rf"\b{re.escape(name.lower())}\b", q)
-        ),
+        (p for p in products
+         if re.search(rf"(?<!\w){re.escape(p.lower())}(?!\w)", q)),
         None,
     )
 
@@ -165,13 +140,12 @@ def detect_filters(question, orders):
 
 
 def apply_filters(orders, filters, forced_status=None):
-    result = orders
-
-    region = filters["region"]
-    month = filters["month"]
-    year = filters["year"]
-    product = filters["product"]
-    status = forced_status or filters["status"]
+    result = list(orders)
+    region = filters.get("region")
+    month = filters.get("month")
+    year = filters.get("year")
+    product = filters.get("product")
+    status = forced_status or filters.get("status")
 
     if region:
         result = [
@@ -193,14 +167,18 @@ def apply_filters(orders, filters, forced_status=None):
         ]
 
     if month or year:
-        result = [
-            o for o in result
-            if (
-                (not month or parse_date(o["created_at"]).month == month)
-                and
-                (not year or parse_date(o["created_at"]).year == year)
-            )
-        ]
+        filtered = []
+        for order in result:
+            date_value = order.get("created_at")
+            if not date_value:
+                continue
+            dt = parse_date(date_value)
+            if month and dt.month != month:
+                continue
+            if year and dt.year != year:
+                continue
+            filtered.append(order)
+        result = filtered
 
     return result
 
@@ -213,68 +191,47 @@ def answer_question(question):
     q = question.lower().strip()
     filters = detect_filters(q, orders)
 
-    # Detect the requested calculation.
-    asks_customer = contains_phrase(
-        q, ["customer", "customers", "distinct customer", "unique customer"]
-    )
-
     asks_refund = contains_phrase(q, ["refund", "refunded"])
+    asks_customer = contains_phrase(
+        q, ["customer", "customers", "client", "clients"]
+    )
     asks_average = contains_phrase(
-        q, ["average", "on average", "avg", "mean", "per order", "worth"]
+        q, ["average", "on average", "avg", "mean"]
     )
-
     asks_count = contains_phrase(
-        q,
-        [
-            "count", "how many", "number of", "quantity of",
-            "total number", "distinct", "unique",
-        ],
+        q, ["count", "how many", "number of", "total number",
+            "quantity of", "distinct", "unique"]
     )
-
+    asks_top = contains_phrase(
+        q, ["top", "highest", "most", "best", "best-selling",
+            "best selling", "top-selling", "top selling"]
+    )
+    asks_units = contains_phrase(
+        q, ["units", "quantity", "items sold", "most sold"]
+    )
     asks_product = (
         filters["product"] is not None
-        or contains_phrase(
-            q,
-            [
-                "product", "products", "best-selling", "best selling",
-                "top-selling", "top selling", "which item",
-            ],
-        )
+        or contains_phrase(q, ["product", "products", "which item"])
     )
-
     asks_revenue = contains_phrase(
-        q,
-        [
-            "revenue", "sales", "earn", "earned", "earns",
-            "earning", "income", "turnover", "generated",
-            "bring in", "how much did",
-        ],
+        q, ["revenue", "sales", "earned", "earnings", "income",
+            "turnover", "generated", "bring in"]
     )
-
     asks_total = contains_phrase(
         q, ["total", "sum", "overall", "altogether"]
     )
 
-    # Questions about customers: count distinct customers after all filters.
+    # Customer questions: count distinct customer names.
     if asks_customer:
-        customer_status = filters["status"]
-
-        if "paid" in q:
-            customer_status = "paid"
-
-        customer_orders = apply_filters(
-            orders, filters, forced_status=customer_status
-        )
-
+        customer_orders = apply_filters(orders, filters)
         customers = {
             str(o.get("customer", "")).strip()
             for o in customer_orders
             if o.get("customer")
         }
-
         return f"There are {len(customers)} unique customers."
 
-    # Refund questions: counts, totals, or averages.
+    # Refund questions.
     if asks_refund:
         refund_orders = apply_filters(
             orders, filters, forced_status="refunded"
@@ -286,57 +243,20 @@ def answer_question(question):
         if asks_average:
             if not refund_orders:
                 return "No matching refunded orders were found."
-
-            # "Worth" or "per unit" refers to unit price;
-            # average order value refers to the full order amount.
-            unit_metric = contains_phrase(
-                q, ["unit price", "per unit", "item price", "worth"]
-            )
-            field = "unit_price" if unit_metric else "amount"
-
-            average = sum(
-                usd_amount(o, rates, field)
-                for o in refund_orders
+            avg = sum(
+                usd_amount(o, rates) for o in refund_orders
             ) / len(refund_orders)
+            return f"The average refunded order value is ${avg:,.2f} USD."
 
-            return f"The average refunded value is ${average:,.2f} USD."
-
-        total = sum(
-            usd_amount(o, rates)
-            for o in refund_orders
-        )
-
+        total = sum(usd_amount(o, rates) for o in refund_orders)
         if asks_count and asks_total:
             return (
                 f"There are {len(refund_orders)} refunded orders. "
-                f"Their total amount is ${total:,.2f} USD."
+                f"Total refunded amount is ${total:,.2f} USD."
             )
-
         return f"Total refunded amount is ${total:,.2f} USD."
 
-    # Average value questions.
-    if asks_average:
-        average_orders = apply_filters(
-            orders, filters, forced_status="paid"
-        )
-
-        if not average_orders:
-            return "No matching paid orders were found."
-
-        # Distinguish average unit price from average order value.
-        unit_metric = contains_phrase(
-            q, ["unit price", "per unit", "item price", "worth"]
-        )
-        field = "unit_price" if unit_metric else "amount"
-
-        average = sum(
-            usd_amount(o, rates, field)
-            for o in average_orders
-        ) / len(average_orders)
-
-        return f"The average value is ${average:,.2f} USD."
-
-    # Product performance and revenue.
+    # Product performance questions.
     if asks_product:
         product_orders = apply_filters(
             orders, filters, forced_status="paid"
@@ -345,44 +265,41 @@ def answer_question(question):
         if not product_orders:
             return "No matching paid product orders were found."
 
-        totals = {}
-        quantities = {}
+        revenue_by_product = {}
+        units_by_product = {}
 
         for order in product_orders:
             name = str(order.get("product", "Unknown"))
-            totals[name] = (
-                totals.get(name, 0.0)
+            revenue_by_product[name] = (
+                revenue_by_product.get(name, 0.0)
                 + usd_amount(order, rates)
             )
-            quantities[name] = (
-                quantities.get(name, 0)
+            units_by_product[name] = (
+                units_by_product.get(name, 0)
                 + int(order.get("qty", 0))
             )
 
-        asks_top = contains_phrase(
-            q,
-            [
-                "top", "best", "highest", "most", "best-selling",
-                "best selling", "top-selling", "top selling",
-            ],
-        )
-
         if asks_top:
-            if contains_phrase(q, ["units", "quantity", "most sold"]):
-                name = max(quantities, key=quantities.get)
+            if asks_units:
+                name = max(units_by_product, key=units_by_product.get)
                 return (
                     f"{name} sold the most units: "
-                    f"{quantities[name]} units."
+                    f"{units_by_product[name]} units."
                 )
-
-            name = max(totals, key=totals.get)
+            name = max(revenue_by_product, key=revenue_by_product.get)
             return (
                 f"{name} had the highest revenue at "
-                f"${totals[name]:,.2f} USD."
+                f"${revenue_by_product[name]:,.2f} USD."
             )
 
         if filters["product"]:
-            total = sum(totals.values())
+            total = sum(revenue_by_product.values())
+            if asks_units:
+                units = sum(units_by_product.values())
+                return (
+                    f"Total units sold for {filters['product']}: "
+                    f"{units} units."
+                )
             return (
                 f"Paid revenue for {filters['product']} is "
                 f"${total:,.2f} USD."
@@ -390,23 +307,33 @@ def answer_question(question):
 
         return "Product revenue (USD): " + "; ".join(
             f"{name}: ${amount:,.2f}"
-            for name, amount in sorted(totals.items())
+            for name, amount in sorted(revenue_by_product.items())
         )
 
-    # Revenue and sales: paid orders only.
+    # Average order value for paid orders.
+    if asks_average:
+        average_orders = apply_filters(
+            orders, filters, forced_status="paid"
+        )
+        if not average_orders:
+            return "No matching paid orders were found."
+
+        avg = sum(
+            usd_amount(o, rates) for o in average_orders
+        ) / len(average_orders)
+        return f"The average paid order value is ${avg:,.2f} USD."
+
+    # Revenue is calculated from paid orders only.
     if asks_revenue:
         revenue_orders = apply_filters(
             orders, filters, forced_status="paid"
         )
-
         total = sum(
-            usd_amount(o, rates)
-            for o in revenue_orders
+            usd_amount(o, rates) for o in revenue_orders
         )
-
         return f"Total revenue is ${total:,.2f} USD."
 
-    # Order counts. Respect any explicit status filter.
+    # Order counts.
     if asks_count or contains_phrase(q, ["orders", "order count"]):
         count_orders = apply_filters(orders, filters)
         return f"There are {len(count_orders)} matching orders."
